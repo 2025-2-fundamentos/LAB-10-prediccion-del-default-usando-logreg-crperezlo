@@ -95,3 +95,173 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+import pandas as pd
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import (
+    precision_score,
+    recall_score,
+    f1_score,
+    balanced_accuracy_score,
+    confusion_matrix,
+)
+import gzip
+import os
+import pickle
+import json
+
+
+
+#Paso 1: limpieza del dataset
+def limpiar_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    #renombrar columna objetivo
+    df = df.rename(columns={"default payment next month": "default"})
+
+    #eliminar columna ID
+    df = df.drop(columns=["ID"], errors="ignore")
+
+    #eliminar filas con datos faltantes
+    df = df.dropna()
+
+    #eliminar registros con info no disponible
+    df = df[(df["EDUCATION"] != 0) & (df["MARRIAGE"] != 0)]
+
+    #EDUCATION > 4 
+    df.loc[df["EDUCATION"] > 4, "EDUCATION"] = 4
+
+    return df
+
+
+
+#carga de datos
+df_train = pd.read_csv(
+    "files/input/train_data.csv.zip",
+    index_col=False,
+    compression="zip",
+)
+df_test = pd.read_csv(
+    "files/input/test_data.csv.zip",
+    index_col=False,
+    compression="zip",
+)
+
+df_train_clean = limpiar_dataset(df_train)
+df_test_clean = limpiar_dataset(df_test)
+
+# paso 2: separar X e y
+X_train = df_train_clean.drop(columns="default")
+y_train = df_train_clean["default"]
+
+X_test = df_test_clean.drop(columns="default")
+y_test = df_test_clean["default"]
+
+
+#paso 3: pipeline
+categorical_features = ["SEX", "EDUCATION", "MARRIAGE"]
+numeric_features = [col for col in X_train.columns if col not in categorical_features]
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("cat", OneHotEncoder(handle_unknown="ignore"), categorical_features),
+        ("num", MinMaxScaler(), numeric_features),
+    ]
+)
+
+pipeline = Pipeline(
+    steps=[
+        ("preprocessing", preprocessor),
+        ("feature_selection", SelectKBest(score_func=f_classif)),
+        (
+            "classifier",
+            LogisticRegression(
+                solver="saga",
+                max_iter=1000,
+                random_state=42,
+            ),
+        ),
+    ]
+)
+
+
+
+#paso 4: GridSearchCV 
+param_grid = {
+    "feature_selection__k": range(1, 11),
+    "classifier__penalty": ["l1", "l2"],
+    "classifier__C": [0.001, 0.01, 0.1, 1, 10, 100],
+}
+
+grid_search = GridSearchCV(
+    pipeline,
+    param_grid=param_grid,
+    cv=10,
+    scoring="balanced_accuracy",
+    n_jobs=-1,
+)
+
+#entrenamiento
+grid_search.fit(X_train, y_train)
+
+
+#Paso 5: guardar modelo comprimido
+# 
+os.makedirs("files/models", exist_ok=True)
+with gzip.open("files/models/model.pkl.gz", "wb") as f:
+    pickle.dump(grid_search, f)
+
+
+
+#Paso 6 y 7: métricas y matrices de confusión
+def calcular_metricas(y_true, y_pred, dataset):
+    return {
+        "type": "metrics",
+        "dataset": dataset,
+        "precision": precision_score(y_true, y_pred),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+        "recall": recall_score(y_true, y_pred),
+        "f1_score": f1_score(y_true, y_pred),
+    }
+
+
+def matriz_confusion_dict(y_true, y_pred, dataset):
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    return {
+        "type": "cm_matrix",
+        "dataset": dataset,
+        "true_0": {
+            "predicted_0": int(cm[0, 0]),
+            "predicted_1": int(cm[0, 1]),
+        },
+        "true_1": {
+            "predicted_0": int(cm[1, 0]),
+            "predicted_1": int(cm[1, 1]),
+        },
+    }
+
+
+# Predicciones
+y_pred_train = grid_search.predict(X_train)
+y_pred_test = grid_search.predict(X_test)
+
+# Lista con métricas y matrices
+metrics = [
+    calcular_metricas(y_train, y_pred_train, "train"),
+    calcular_metricas(y_test, y_pred_test, "test"),
+    matriz_confusion_dict(y_train, y_pred_train, "train"),
+    matriz_confusion_dict(y_test, y_pred_test, "test"),
+]
+
+# Guardar metrics.json
+os.makedirs("files/output", exist_ok=True)
+with open("files/output/metrics.json", "w", encoding="utf-8") as f:
+    for row in metrics:
+        json.dump(row, f)
+        f.write("\n")
+
+print("Train score:", grid_search.score(X_train, y_train))
+print("Test score:", grid_search.score(X_test, y_test))
